@@ -1,0 +1,11 @@
+# Build files
+build/
+
+# Compiled executable
+camera_pipeline
+
+# macOS
+.DS_Store
+
+# Test data
+data/
