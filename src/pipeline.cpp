@@ -6,6 +6,8 @@
 #include <mutex>
 #include <utility>
 #include <condition_variable>
+#include <vector>
+#include <algorithm>
 std::condition_variable not_empty;
 bool producer_done = false;
 
@@ -19,19 +21,30 @@ std::queue<Frame> buffer;
 std::mutex mtx;
 
 const size_t MAX_BUFFER_SIZE = 5;
-
+std::vector<double> latencies;
 int produced_count = 0;
 int consumed_count = 0;
 int dropped_count = 0;
 double total_decode_ms = 0.0;
 double total_clone_ms = 0.0;
 double total_process_ms = 0.0;  // Consumer 使用
+double total_latency_ms = 0.0;
+double max_latency_ms = 0.0;
+double max_wait_ms = 0.0;
+double max_process_ms = 0.0;
 
 void producer() {
     cv::VideoCapture cap("data/test.mp4");
 
     if (!cap.isOpened()) {
         std::cerr << "Failed to open video!" << std::endl;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            producer_done = true;
+        }
+
+        not_empty.notify_one();
         return;
     }
 
@@ -114,15 +127,35 @@ void consumer() {
             consumed_count++;
         }
         auto process_start = std::chrono::steady_clock::now();
+        double wait_ms =
+            std::chrono::duration<double, std::milli>(
+                process_start - frame.timestamp
+            ).count();
+
+        max_wait_ms = std::max(max_wait_ms, wait_ms);
 
         cv::Mat gray;
         cv::cvtColor(frame.image, gray, cv::COLOR_BGR2GRAY);
+        // std::this_thread::sleep_for(std::chrono::milliseconds(10));
         auto process_end = std::chrono::steady_clock::now();
+        double process_ms =
+            std::chrono::duration<double, std::milli>(
+                process_end - process_start
+            ).count();
 
+        max_process_ms = std::max(max_process_ms, process_ms);
         total_process_ms +=
             std::chrono::duration<double, std::milli>(
                 process_end - process_start
             ).count();
+
+        double latency_ms =
+        std::chrono::duration<double, std::milli>(
+            process_end - frame.timestamp
+        ).count();
+        latencies.push_back(latency_ms);
+        total_latency_ms += latency_ms;
+        max_latency_ms = std::max(max_latency_ms, latency_ms);
         // std::cout << "Processed frame: "
         //           << frame.id << std::endl;
     }
@@ -144,23 +177,49 @@ int main() {
 
     producer_thread.join();
     consumer_thread.join();
+    auto end = std::chrono::steady_clock::now();
+    std::sort(latencies.begin(), latencies.end());
+
+    if (!latencies.empty()) {
+        size_t n = latencies.size();
+
+        double p50 = latencies[static_cast<size_t>(0.50 * (n - 1))];
+        double p95 = latencies[static_cast<size_t>(0.95 * (n - 1))];
+        double p99 = latencies[static_cast<size_t>(0.99 * (n - 1))];
+
+        std::cout << "P50 latency: " << p50 << " ms\n";
+        std::cout << "P95 latency: " << p95 << " ms\n";
+        std::cout << "P99 latency: " << p99 << " ms\n";
+    }
+    double elapsed_sec =
+        std::chrono::duration<double>(end - start).count();
     std::cout << "Average decode time: "
           << total_decode_ms / produced_count
           << " ms/frame" << std::endl;
     std::cout << "Average clone time: "
             << total_clone_ms / produced_count << " ms/frame\n";
+    std::cout << "Average latency: "
+            << total_latency_ms / consumed_count
+            << " ms/frame\n";
 
+    std::cout << "Max latency: "
+            << max_latency_ms
+            << " ms\n";
+    std::cout << "Max wait time: "
+            << max_wait_ms << " ms\n";
+
+    std::cout << "Max process time: "
+            << max_process_ms << " ms\n";
+            
     std::cout << "Average process time: "
             << total_process_ms / consumed_count << " ms/frame\n";
-    auto end = std::chrono::steady_clock::now();
     std::cout << "\n===== Pipeline Statistics =====\n";
     std::cout << "Produced: " << produced_count << std::endl;
     std::cout << "Consumed: " << consumed_count << std::endl;
     std::cout << "Dropped: " << dropped_count << std::endl;
     std::cout << "Remaining: " << buffer.size() << std::endl;
     std::cout << "Pipeline finished." << std::endl;
-    double elapsed_sec =
-        std::chrono::duration<double>(end - start).count();
+
 
     double pipeline_fps = consumed_count / elapsed_sec;
 
