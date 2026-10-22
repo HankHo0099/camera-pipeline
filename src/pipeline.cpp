@@ -17,9 +17,25 @@ struct Frame {
     std::chrono::steady_clock::time_point timestamp;
 };
 
+enum class DropPolicy {
+    Oldest,
+    Newest
+};
+
+struct PipelineConfig {
+    std::string video_path = "data/test.mp4";
+
+    int target_fps = 75;
+    size_t queue_capacity = 5;
+    int consumer_delay_ms = 10;
+
+    bool enable_fps_limit = true;
+    DropPolicy drop_policy = DropPolicy::Newest;
+};
+
 std::queue<Frame> buffer;
 std::mutex mtx;
-
+const PipelineConfig config;
 const size_t MAX_BUFFER_SIZE = 5;
 std::vector<double> latencies;
 int produced_count = 0;
@@ -34,7 +50,12 @@ double max_wait_ms = 0.0;
 double max_process_ms = 0.0;
 
 void producer() {
-    cv::VideoCapture cap("data/test.mp4");
+
+    auto frame_interval = std::chrono::duration<double>(
+        1.0 / config.target_fps
+    );
+
+    cv::VideoCapture cap(config.video_path);
 
     if (!cap.isOpened()) {
         std::cerr << "Failed to open video!" << std::endl;
@@ -47,64 +68,78 @@ void producer() {
         not_empty.notify_one();
         return;
     }
+    auto next_frame_time = std::chrono::steady_clock::now();
 
     cv::Mat image;
     int frame_count = 0;
 
     while (true) {
-    auto decode_start = std::chrono::steady_clock::now();
+        auto decode_start = std::chrono::steady_clock::now();
 
-    bool success = cap.read(image);
+        bool success = cap.read(image);
 
-    auto decode_end = std::chrono::steady_clock::now();
+        auto decode_end = std::chrono::steady_clock::now();
 
-    if (!success) {
-        break;
-    }
+        if (!success) {
+            break;
+        }
 
-    total_decode_ms +=
+        total_decode_ms +=
         std::chrono::duration<double, std::milli>(
             decode_end - decode_start
         ).count();
 
-    frame_count++;
+        frame_count++;
 
-    Frame frame;
-    frame.id = frame_count;
-    auto clone_start = std::chrono::steady_clock::now();
+        Frame frame;
+        frame.id = frame_count;
+        auto clone_start = std::chrono::steady_clock::now();
 
-    frame.image = image.clone();
+        frame.image = image.clone();
 
-    auto clone_end = std::chrono::steady_clock::now();
+        auto clone_end = std::chrono::steady_clock::now();
 
-    total_clone_ms +=
+        total_clone_ms +=
         std::chrono::duration<double, std::milli>(
             clone_end - clone_start
         ).count();
 
-    frame.timestamp = std::chrono::steady_clock::now();
+        frame.timestamp = std::chrono::steady_clock::now();
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            produced_count++;
+            if (buffer.size() >= config.queue_capacity) {
+                if (config.drop_policy == DropPolicy::Oldest) {
+                    buffer.pop();
+                    buffer.push(std::move(frame));
+                }
+
+                dropped_count++;
+            } else {
+                buffer.push(std::move(frame));
+            }
+        }
+        not_empty.notify_one();
+            
+        if (config.enable_fps_limit) {
+            next_frame_time += std::chrono::duration_cast<
+                std::chrono::steady_clock::duration
+            >(frame_interval);
+
+            std::this_thread::sleep_until(next_frame_time);
+        }
+        
+    }    std::cout << "Producer finished. Frames: "
+              << frame_count << std::endl;
 
     {
         std::lock_guard<std::mutex> lock(mtx);
-        produced_count++;
-        if (buffer.size() >= MAX_BUFFER_SIZE) {
-            buffer.pop();
-            dropped_count++;
-        }
-
-        buffer.push(std::move(frame));
-    }
-    not_empty.notify_one();
-    }
-
-    std::cout << "Producer finished. Frames: "
-              << frame_count << std::endl;
-              {
-    std::lock_guard<std::mutex> lock(mtx);
-    producer_done = true;
+        producer_done = true;
     }
 
     not_empty.notify_one();
+
 }
 
 void consumer() {
@@ -136,7 +171,12 @@ void consumer() {
 
         cv::Mat gray;
         cv::cvtColor(frame.image, gray, cv::COLOR_BGR2GRAY);
-        // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (config.consumer_delay_ms > 0) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(config.consumer_delay_ms)
+            );
+        }
+
         auto process_end = std::chrono::steady_clock::now();
         double process_ms =
             std::chrono::duration<double, std::milli>(
