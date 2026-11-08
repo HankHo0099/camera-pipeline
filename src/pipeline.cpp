@@ -8,8 +8,7 @@
 #include <condition_variable>
 #include <vector>
 #include <algorithm>
-std::condition_variable not_empty;
-bool producer_done = false;
+#include <stdexcept>
 
 struct Frame {
     int id;
@@ -20,6 +19,13 @@ struct Frame {
 enum class DropPolicy {
     Oldest,
     Newest
+};
+
+enum class PushResult {
+    Pushed,
+    DroppedOldest,
+    DroppedNewest,
+    Closed
 };
 
 struct PipelineConfig {
@@ -33,71 +39,86 @@ struct PipelineConfig {
     DropPolicy drop_policy = DropPolicy::Newest;
 };
 
+
 class BoundedQueue {
-    private:
-        std::queue<Frame> buffer_;
-        std::mutex mtx_;
-        std::condition_variable not_empty_;
+private:
+    std::queue<Frame> buffer_;
+    mutable std::mutex mtx_;
+    std::condition_variable not_empty_;
 
-        size_t capacity_;
-        DropPolicy policy_;
-        bool closed_ = false;
+    size_t capacity_;
+    DropPolicy policy_;
+    bool closed_ = false;
 
-    public:
-        BoundedQueue(size_t capacity, DropPolicy policy)
-            : capacity_(capacity), policy_(policy) {
+public:
+    BoundedQueue(size_t capacity, DropPolicy policy)
+        : capacity_(capacity), policy_(policy) {
+        if (capacity_ == 0) {
+            throw std::invalid_argument("Queue capacity must be > 0");
         }
-        bool push(Frame frame) {
+    }
+
+    PushResult push(Frame frame) {
+        PushResult result = PushResult::Pushed;
+
         {
             std::lock_guard<std::mutex> lock(mtx_);
 
             if (closed_) {
-                return false;
+                return PushResult::Closed;
             }
 
             if (buffer_.size() >= capacity_) {
                 if (policy_ == DropPolicy::Oldest) {
                     buffer_.pop();
+                    result = PushResult::DroppedOldest;
                 } else {
-                    return false;
+                    return PushResult::DroppedNewest;
                 }
             }
 
             buffer_.push(std::move(frame));
         }
-            not_empty_.notify_one();
-            return true;
+
+        not_empty_.notify_one();
+        return result;
+    }
+
+    bool pop(Frame& frame) {
+        std::unique_lock<std::mutex> lock(mtx_);
+
+        not_empty_.wait(lock, [this] {
+            return !buffer_.empty() || closed_;
+        });
+
+        if (buffer_.empty()) {
+            return false;
         }
-        bool pop(Frame& frame) {
-            std::unique_lock<std::mutex> lock(mtx_);
 
-            not_empty_.wait(lock, [this] {
-                return !buffer_.empty() || closed_;
-            });
+        frame = std::move(buffer_.front());
+        buffer_.pop();
+        return true;
+    }
 
-            if (buffer_.empty()) {
-                return false;
-            }
-
-            frame = std::move(buffer_.front());
-            buffer_.pop();
-
-            return true;
+    void close() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            closed_ = true;
         }
-        void close() {
-            {
-                std::lock_guard<std::mutex> lock(mtx_);
-                closed_ = true;
-            }
 
-            not_empty_.notify_all();
-        }
+        not_empty_.notify_all();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return buffer_.size();
+    }
 };
 
-std::queue<Frame> buffer;
-std::mutex mtx;
+
 const PipelineConfig config;
-const size_t MAX_BUFFER_SIZE = 5;
+BoundedQueue buffer(config.queue_capacity, config.drop_policy);
+
 std::vector<double> latencies;
 int produced_count = 0;
 int consumed_count = 0;
@@ -121,12 +142,7 @@ void producer() {
     if (!cap.isOpened()) {
         std::cerr << "Failed to open video!" << std::endl;
 
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            producer_done = true;
-        }
-
-        not_empty.notify_one();
+        buffer.close();
         return;
     }
     auto next_frame_time = std::chrono::steady_clock::now();
@@ -167,21 +183,16 @@ void producer() {
 
         frame.timestamp = std::chrono::steady_clock::now();
 
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            produced_count++;
-            if (buffer.size() >= config.queue_capacity) {
-                if (config.drop_policy == DropPolicy::Oldest) {
-                    buffer.pop();
-                    buffer.push(std::move(frame));
-                }
-
-                dropped_count++;
-            } else {
-                buffer.push(std::move(frame));
-            }
+        ++produced_count;
+        const PushResult result = buffer.push(std::move(frame));
+        if (result == PushResult::DroppedOldest ||
+            result == PushResult::DroppedNewest ||
+            result == PushResult::Closed) {
+            ++dropped_count;
         }
-        not_empty.notify_one();
+        if (result == PushResult::Closed) {
+            break;
+        }
             
         if (config.enable_fps_limit) {
             next_frame_time += std::chrono::duration_cast<
@@ -191,15 +202,11 @@ void producer() {
             std::this_thread::sleep_until(next_frame_time);
         }
         
-    }    std::cout << "Producer finished. Frames: "
+    }
+    std::cout << "Producer finished. Frames: "
               << frame_count << std::endl;
 
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        producer_done = true;
-    }
-
-    not_empty.notify_one();
+    buffer.close();
 
 }
 
@@ -207,21 +214,10 @@ void consumer() {
     while (true) {
         Frame frame;
 
-        {
-            std::unique_lock<std::mutex> lock(mtx);
-
-            not_empty.wait(lock, [] {
-                return !buffer.empty() || producer_done;
-            });
-
-            if (buffer.empty() && producer_done) {
-                break;
-            }
-
-            frame = std::move(buffer.front());
-            buffer.pop();
-            consumed_count++;
+        if (!buffer.pop(frame)) {
+            break;
         }
+        ++consumed_count;
         auto process_start = std::chrono::steady_clock::now();
         double wait_ms =
             std::chrono::duration<double, std::milli>(
@@ -295,12 +291,12 @@ int main() {
     double elapsed_sec =
         std::chrono::duration<double>(end - start).count();
     std::cout << "Average decode time: "
-          << total_decode_ms / produced_count
+          << (produced_count > 0 ? total_decode_ms / produced_count : 0.0)
           << " ms/frame" << std::endl;
     std::cout << "Average clone time: "
-            << total_clone_ms / produced_count << " ms/frame\n";
+            << (produced_count > 0 ? total_clone_ms / produced_count : 0.0) << " ms/frame\n";
     std::cout << "Average latency: "
-            << total_latency_ms / consumed_count
+            << (consumed_count > 0 ? total_latency_ms / consumed_count : 0.0)
             << " ms/frame\n";
 
     std::cout << "Max latency: "
@@ -313,7 +309,7 @@ int main() {
             << max_process_ms << " ms\n";
             
     std::cout << "Average process time: "
-            << total_process_ms / consumed_count << " ms/frame\n";
+            << (consumed_count > 0 ? total_process_ms / consumed_count : 0.0) << " ms/frame\n";
     std::cout << "\n===== Pipeline Statistics =====\n";
     std::cout << "Produced: " << produced_count << std::endl;
     std::cout << "Consumed: " << consumed_count << std::endl;
