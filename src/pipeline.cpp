@@ -33,6 +33,67 @@ struct PipelineConfig {
     DropPolicy drop_policy = DropPolicy::Newest;
 };
 
+class BoundedQueue {
+    private:
+        std::queue<Frame> buffer_;
+        std::mutex mtx_;
+        std::condition_variable not_empty_;
+
+        size_t capacity_;
+        DropPolicy policy_;
+        bool closed_ = false;
+
+    public:
+        BoundedQueue(size_t capacity, DropPolicy policy)
+            : capacity_(capacity), policy_(policy) {
+        }
+        bool push(Frame frame) {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            if (closed_) {
+                return false;
+            }
+
+            if (buffer_.size() >= capacity_) {
+                if (policy_ == DropPolicy::Oldest) {
+                    buffer_.pop();
+                } else {
+                    return false;
+                }
+            }
+
+            buffer_.push(std::move(frame));
+        }
+            not_empty_.notify_one();
+            return true;
+        }
+        bool pop(Frame& frame) {
+            std::unique_lock<std::mutex> lock(mtx_);
+
+            not_empty_.wait(lock, [this] {
+                return !buffer_.empty() || closed_;
+            });
+
+            if (buffer_.empty()) {
+                return false;
+            }
+
+            frame = std::move(buffer_.front());
+            buffer_.pop();
+
+            return true;
+        }
+        void close() {
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                closed_ = true;
+            }
+
+            not_empty_.notify_all();
+        }
+};
+
 std::queue<Frame> buffer;
 std::mutex mtx;
 const PipelineConfig config;

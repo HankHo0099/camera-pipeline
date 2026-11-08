@@ -32,3 +32,15 @@ target_link_libraries(pipeline PRIVATE
     opencv_videoio
     opencv_imgproc
 )
+
+add_executable(benchmark_single src/benchmark_single.cpp)
+
+target_include_directories(benchmark_single PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+)
+
+target_link_libraries(benchmark_single PRIVATE
+    opencv_core
+    opencv_videoio
+    opencv_imgproc
+)
