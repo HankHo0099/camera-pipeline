@@ -7,44 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(OpenCV REQUIRED)
 
-add_executable(camera_pipeline
-    src/main.cpp
-)
-target_include_directories(camera_pipeline PRIVATE
-    ${OpenCV_INCLUDE_DIRS}
-)
-target_link_libraries(camera_pipeline
-    PRIVATE
-    opencv_core
-    opencv_videoio
-    opencv_imgproc
-)
-
-
-add_executable(pipeline src/pipeline.cpp)
-
-target_include_directories(pipeline PRIVATE
-    ${OpenCV_INCLUDE_DIRS}
-)
-
-target_link_libraries(pipeline PRIVATE
-    opencv_core
-    opencv_videoio
-    opencv_imgproc
-)
-
-add_executable(benchmark_single src/benchmark_single.cpp)
-
-target_include_directories(benchmark_single PRIVATE
-    ${OpenCV_INCLUDE_DIRS}
-)
-
-target_link_libraries(benchmark_single PRIVATE
-    opencv_core
-    opencv_videoio
-    opencv_imgproc
-)
-
 add_executable(image_processing_demo
     src/image_processing_demo.cpp
     src/image_processing.cpp

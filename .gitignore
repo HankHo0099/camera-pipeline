@@ -43,3 +43,35 @@ results/
 *.dylib
 
 /thread_demo
+
+# Additional media formats and compiler outputs
+*.mpeg
+*.mpg
+*.wmv
+*.m2ts
+*.mts
+*.flv
+*.mjpeg
+*.ppm
+*.pgm
+*.pbm
+*.pnm
+*.avif
+*.heic
+*.heif
+*.ico
+*.svg
+*.raw
+*.d
+*.pch
+*.gch
+*.idb
+*.ipch
+*.res
+*.out
+*.app
+*.so.*
+/benchmark_pipeline
+/image_processing_demo
+/pipeline
+/benchmark_single
